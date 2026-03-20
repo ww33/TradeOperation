@@ -14,7 +14,7 @@ export class TradeOperation {
     }; // Хранилище для промиса
     private orderId: string = ''
     private tickSize: number = 0
-    private slPercent: number = 0.6
+    private slPercent: number = 0.0
     private orderPrice: string = ''
     private orderStopLoss: string = '0'
     private mode: 'ENTRY' | 'WATCH' | 'GUARD' = 'ENTRY';
@@ -22,11 +22,11 @@ export class TradeOperation {
 
     constructor() {
         this.bus = new BybitDataBus();
-
     }
 
     public async start(params: any) {
         this.params = params;
+        this.slPercent = params.slPercent ? params.slPercent : 0
 
         // 1. Подписываемся и ждем первых цен
         await this.bus.subscribe(params.ticker);
@@ -41,6 +41,23 @@ export class TradeOperation {
     private async tick() {
         // 1. ПРЕДОХРАНИТЕЛИ: проверка связи и занятости API
         if (!this.bus.isDataReady || this.isApiBusy) return;
+
+        // ПРОВЕРКА: А есть ли вообще позиция?
+        // Если мы в режиме WATCH или GUARD, но позиция на бирже уже 0
+        if (this.mode === 'WATCH' || this.mode === 'GUARD') {
+            const pos = await client.getPositionInfo({
+                category: 'linear',
+                symbol: this.params.ticker
+            });
+
+            const size = parseFloat(pos.result.list[0]?.size || "0");
+
+            if (size === 0) {
+                console.log("🏁 Позиция закрыта извне (стоп или TP). Завершаем работу.");
+                this.stop("Done (External)");
+                return;
+            }
+        }
 
         // Гарантируем паузу 200мс между запросами (наш "бронежилет")
         if (Date.now() - this.lastRequestTime < 200) return;
@@ -57,7 +74,6 @@ export class TradeOperation {
                     this.mode = 'WATCH';
                     return;
                 }
-
                 // ВАЖНО: Если amendOrder вернул ошибку "order not exists"
                 // Мы должны СРАЗУ сбросить флаг или вызвать проверку статуса
                 const amendResult = await this.handleAmendLogic();
@@ -68,6 +84,7 @@ export class TradeOperation {
                 }
                 return; // <--- ОБЯЗАТЕЛЬНО добавить здесь
             }
+            // --- РЕЖИМ 2: НАБЛЮДЕНИЕ (WATCH) ---
             else if (this.mode === 'WATCH') {
                 // Просто измеряем расстояние до стопа
                 await this.handleWatchLogic();
@@ -228,68 +245,60 @@ export class TradeOperation {
     private async handleAmendLogic(): Promise<string | void> {
         const isLong = this.params.operation === 'BuyLimit';
         const targetPrice = isLong ? this.bus.bid : this.bus.ask;
+
+        // 1. Округляем целевую цену
         const formattedTarget = roundStep(targetPrice, this.tickSize);
 
-        // 2. СРАВНИВАЕМ СТРОКИ. Если они идентичны — выходим
+        // 2. БАЗОВЫЕ ПРОВЕРКИ
+        // Если цена в стакане совпадает с нашим ордером - выходим
         if (formattedTarget === this.orderPrice) return;
 
-        // 3. Считаем процент отклонения
         const p1 = parseFloat(formattedTarget);
         const p2 = parseFloat(this.orderPrice);
-        const percentDiff = (Math.abs(p1 - p2) / p2) * 100;
 
-        // 4. ГЛАВНОЕ ИЗМЕНЕНИЕ:
-        // Если мы ВХОДИМ (ENTRY), то соблюдаем порог (например, 0.1%)
-        // Если мы СПАСАЕМСЯ (GUARD), то ПЛЕВАТЬ на порог — двигаем за каждым тиком!
-        if (this.mode !== 'GUARD' && percentDiff < this.params.minStepToAmend) {
+        // ЗАЩИТА: Если цена ордера еще не инициализирована (0 или NaN)
+        if (!p2 || isNaN(p1) || isNaN(p2)) {
+            // console.log("Ожидание инициализации цен...");
             return;
         }
 
-        // 5. Шлем Amend
-        console.log(`[${this.mode}] Amend ${percentDiff.toFixed(3)}% -> ${formattedTarget}`);
-        // // 1. Выбираем целевую цену (Long следит за Bid, Short за Ask)
-        // const isLong = this.params.operation === 'BuyLimit';
-        // const targetPrice = isLong ? this.bus.bid : this.bus.ask;
-        // const formattedTarget = roundStep(targetPrice, this.tickSize);
-        // // 2. СРАВНИВАЕМ СТРОКИ. Если они идентичны — выходим без расчетов
-        // if (formattedTarget === this.orderPrice) return// console.log("Цена в стакане совпадает с нашим ордером. Пропускаем.");
-        // // 3. Только если цены РАЗНЫЕ, считаем процент для лога
-        // const p1 = parseFloat(formattedTarget);
-        // const p2 = parseFloat(this.orderPrice);
-        // const percentDiff = (Math.abs(p1 - p2) / p2) * 100;
-        // // 4. Если процент всё равно мизерный — тоже выходим
-        // if (percentDiff < this.params.minStepToAmend) return;
-        // // 5. Вот теперь шлем Amend
-        // console.log(`Amend ${percentDiff.toFixed(3)}% -> ${formattedTarget}`);
+        // 3. Считаем процент отклонения
+        const percentDiff = (Math.abs(p1 - p2) / p2) * 100;
 
+        // 4. ПРОВЕРКА ПОРОГА
+        // В режиме GUARD (выход) игнорируем порог для максимальной скорости
+        if (this.mode !== 'GUARD' && percentDiff < this.params.minStepToAmend) {
+            return;
+        }
         try {
-            const side = isLong ? 'Buy' : 'Sell';
+            // 5. ОТПРАВКА ЗАПРОСА
+            try {
+                console.log(`[${this.mode}] Amend ${percentDiff.toFixed(3)}% -> ${formattedTarget}`);
+                const isGuard = this.mode === 'GUARD';
 
-            // Округляем цену входа и стоп-лосса
-            const formattedPrice = roundStep(targetPrice, this.tickSize);
-            const formattedSL = this.getStopLoss(side, parseFloat(formattedPrice));
+                const res = await client.amendOrder({
+                    category: 'linear',
+                    symbol: this.params.ticker,
+                    orderId: this.orderId,
+                    price: formattedTarget,
+                    // ПРАВКА: Если мы в GUARD, не шлем параметр stopLoss вообще!
+                    ...(isGuard ? {} : {stopLoss: this.getStopLoss(isLong ? 'Buy' : 'Sell', p1)})
+                });
+                if (res.retCode === 0) {
+                    this.orderPrice = formattedTarget;
+                    this.lastRequestTime = Date.now();
+                    console.log(`[OK] ${this.mode} передвинут успешно.`);
+                } else {
+                    console.error(`Ошибка ${this.mode} Amend:`, res.retMsg);
 
-            const res = await client.amendOrder({
-                category: 'linear',
-                symbol: this.params.ticker,
-                orderId: this.orderId,
-                price: formattedPrice,
-                stopLoss: formattedSL,
-            });
-
-            if (res.retCode === 0) {
-                // ОБЯЗАТЕЛЬНО обновляем текущую цену в памяти, чтобы не зациклиться
-                this.orderPrice = formattedPrice;
-                console.log(`[OK] Ордер передвинут успешно.`);
-            } else {//res.retCode != 0
-                // Если ошибка (например, ордер уже исполнился) — tick() на следующем круге
-                // вызовет checkOrderStatus и всё поймет сам.
-                console.warn("Amend отклонен биржей:", res.retMsg);
-                // Если ордера нет — значит его НЕТ. Останавливаем попытки.
-                if (res.retMsg.includes("not exists") || res.retMsg.includes("too late")) {
-                    this.orderId = ""; // Это заставит checkOrderStatus в след. тике лезть в историю
-                    this.orderPrice = "0";
+                    // Если ордера нет (уже исполнен или отменен) - сбрасываем ID
+                    if (res.retMsg.includes("not exists") || res.retMsg.includes("too late")) {
+                        this.orderId = "";
+                        return 'ERROR_STUCK';
+                    }
                 }
+            } catch (e: any) {
+                console.error(`Критическая ошибка ${this.mode} Amend:`, e.message);
                 return 'ERROR_STUCK';
             }
         } catch (e: any) {
@@ -324,8 +333,9 @@ export class TradeOperation {
             }).catch(() => console.log("Не удалось отодвинуть стоп, возможно он уже сработал"));
 
             // 2. Теперь спокойно выставляем лимитку на выход
-            await this.initialExit();
+            this.orderStopLoss = "0";
             this.mode = 'GUARD';
+            await this.initialExit();
         }
     }
 
