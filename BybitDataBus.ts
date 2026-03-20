@@ -29,8 +29,8 @@ export class BybitDataBus {
         this.ws.on('update', (response) => {
             const { topic, data } = response;
             if (topic.startsWith('orderbook')) {
-                const b = data.b?.[0]?.[0];
-                const a = data.a?.[0]?.[0];
+                const b = data.b && data.b.length > 0 ? data.b[0][0] : null;
+                const a = data.a && data.a.length > 0 ? data.a[0][0] : null;
                 if (b) this.bid = b;
                 if (a) this.ask = a;
                 if (this.bid !== "0" && this.ask !== "0") this.isDataReady = true;

@@ -66,24 +66,12 @@ export class TradeOperation {
                     console.warn("Похоже, ордер потерян. Проверяем историю...");
                     // На следующем тике checkOrderStatus всё разрулит
                 }
+                return; // <--- ОБЯЗАТЕЛЬНО добавить здесь
             }
-                // if (this.mode === 'ENTRY') {
-                //     const status = await this.checkOrderStatus();
-                //
-                //     if (status === 'Filled') {
-                //         console.log("🎯 ВХОД ИСПОЛНЕН! Переходим в режим WATCH (мониторинг SL).");
-                //         this.mode = 'WATCH';
-                //         return; // Выходим из текущего тика, чтобы на следующем начать WATCH
-                //     }
-                //
-                //     // Если еще не исполнился — продолжаем "погоню" за входом
-                //     await this.handleAmendLogic();
-                // }
-
-            // --- РЕЖИМ 2: НАБЛЮДЕНИЕ (WATCH) ---
             else if (this.mode === 'WATCH') {
                 // Просто измеряем расстояние до стопа
                 await this.handleWatchLogic();
+                return; // <--- ОБЯЗАТЕЛЬНО добавить здесь
             }
 
             // --- РЕЖИМ 3: ВЫХОД (GUARD) ---
@@ -106,6 +94,7 @@ export class TradeOperation {
 
                 // 3. Если статус 'New' — продолжаем "погоню"
                 await this.handleAmendLogic();
+                return; // <--- ОБЯЗАТЕЛЬНО добавить здесь
             }
 
         } catch (e: any) {
@@ -299,6 +288,7 @@ export class TradeOperation {
                 // Если ордера нет — значит его НЕТ. Останавливаем попытки.
                 if (res.retMsg.includes("not exists") || res.retMsg.includes("too late")) {
                     this.orderId = ""; // Это заставит checkOrderStatus в след. тике лезть в историю
+                    this.orderPrice = "0";
                 }
                 return 'ERROR_STUCK';
             }
