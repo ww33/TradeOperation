@@ -1,11 +1,19 @@
-import {BybitDataBus} from "./BybitDataBus.ts";
+import {BybitDataBus} from "./BybitDataBus";
 import {RestClientV5} from 'bybit-api'
-import {getBybitKey} from './settings.ts'
+import {getBybitKey} from './settings'
 
 const {key, secret} = getBybitKey()
-const client = new RestClientV5({key: key, secret: secret, testnet: false, parseAPIRateLimits: true,});
+const client = new RestClientV5({
+    key: key,
+    secret: secret,
+    testnet: false,
+    parseAPIRateLimits: true,
+    enable_time_sync: true, // Бот сам спросит время у Bybit перед стартом
+    recv_window: 20000,            // Увеличиваем окно до 20 сек (на случай лагов сети)
+});
 
 export class TradeOperation {
+    private isStopping: boolean = false;
     private isApiBusy: boolean = false;
     private timer: NodeJS.Timeout | null = null;
     private bus: BybitDataBus;
@@ -40,7 +48,7 @@ export class TradeOperation {
 
     private async tick() {
         // 1. ПРЕДОХРАНИТЕЛИ: проверка связи и занятости API
-        if (!this.bus.isDataReady || this.isApiBusy) return;
+        if (this.isStopping || !this.bus.isDataReady || this.isApiBusy) return;
 
         // ПРОВЕРКА: А есть ли вообще позиция?
         // Если мы в режиме WATCH или GUARD, но позиция на бирже уже 0
@@ -102,11 +110,19 @@ export class TradeOperation {
                     await this.initialExit(); // СОЗДАЕМ НОВУЮ ЛИМИТКУ
                     return;
                 }
+                // В tick() перед тем как написать "Позиция закрыта"
+                const pos = await client.getPositionInfo({ category: 'linear', symbol: this.params.ticker });
+                const size = Math.abs(parseFloat(pos.result.list[0]?.size || "0"));
 
-                if (status === 'Filled') {
-                    console.log("✅ ВЫХОД ИСПОЛНЕН! Позиция закрыта.");
+                if (status === 'Filled' && size === 0) {
+                    console.log("✅ ВЫХОД ПОДТВЕРЖДЕН: Позиция реально 0.");
+                    this.orderId = ""; // Сбрасываем ID
+                    this.orderPrice = "0";
                     this.stop("Done");
-                    return;
+
+                } else if (status === 'Filled' && size > 0) {
+                    console.warn("❌ ОШИБКА: Ордер якобы Filled, но позиция еще есть! Продолжаем GUARD.");
+                    this.orderId = ""; // Сбрасываем ID, чтобы перевыставить лимитку
                 }
 
                 // 3. Если статус 'New' — продолжаем "погоню"
@@ -146,7 +162,11 @@ export class TradeOperation {
             });
 
             if (history.retCode === 0 && history.result.list.length > 0) {
-                return history.result.list[0].orderStatus; // Вернет 'Filled' или 'Cancelled'
+                const histOrder = history.result.list[0];
+                // Проверяем, что это именно НАШ ордер на выход
+                if (histOrder.orderId === this.orderId && histOrder.orderStatus === 'Filled') {
+                    return 'Filled';
+                }
             }
 
             return "Unknown"; // Если совсем ничего не нашли
@@ -296,6 +316,17 @@ export class TradeOperation {
                         this.orderId = "";
                         return 'ERROR_STUCK';
                     }
+                    // 2. ФИКС ДЛЯ СКРИНШОТА: Частичное исполнение
+                    // "you cannot modify... in PartiallyFilled status"
+                    if (res.retMsg.includes("PartiallyFilled")) {
+                        console.log("🧩 Ордер частично исполнен. Замираем и ждем наполнения...");
+
+                        // Обновляем orderPrice текущей ценой, чтобы percentDiff стал 0
+                        // и следующая попытка Amend не случилась до изменения цены в стакане
+                        this.orderPrice = formattedTarget;
+
+                        return; // Просто выходим из метода, не сбрасывая ID
+                    }
                 }
             } catch (e: any) {
                 console.error(`Критическая ошибка ${this.mode} Amend:`, e.message);
@@ -364,9 +395,54 @@ export class TradeOperation {
     }
 
     private stop(reason: string) {
-        if (this.timer) clearInterval(this.timer);
+        if (this.isStopping) return; // Если уже останавливаемся - игнорируем повторы
+        this.isStopping = true;
+
+        console.log(`🛑 ОСТАНОВКА: ${reason}`);
+
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = null;
+        }
+
+        this.orderId = ""; // Стираем ID сразу, чтобы Amend не прошел
         this.bus.stop();
         this.resolve(reason);
+    }
+    public async emergencyStop() {
+        console.log(`🛑 [${this.params?.ticker || '---'}] ВЫЗВАН EMERGENCY STOP`);
+
+        // 1. ОСТАНОВКА ЦИКЛА (Самое важное)
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = null; // Обнуляем, чтобы tick больше никогда не вызвался
+        }
+
+        // 2. ОЧИСТКА БИРЖИ
+        try {
+            // Отменяем все активные ордера по тикеру (лимитки входа или выхода)
+            if (this.params?.ticker) {
+                await client.cancelAllOrders({
+                    category: 'linear',
+                    symbol: this.params.ticker
+                });
+                console.log(`[${this.params.ticker}] Все активные ордера отменены.`);
+            }
+        } catch (e: any) {
+            console.warn("Не удалось отменить ордера (возможно, их нет):", e.message);
+        } finally {
+            // 3. ЗАКРЫТИЕ СОЕДИНЕНИЯ
+            // Обязательно вызываем стоп у шины данных, чтобы закрыть WebSocket
+            if (this.bus) {
+                this.bus.stop();
+            }
+
+            // 4. ЗАВЕРШЕНИЕ ПРОМИСА
+            // Чтобы await ta.start(params) в сторе наконец-то "отпустило"
+            if (this.resolve) {
+                this.resolve("Stopped");
+            }
+        }
     }
 }
 

@@ -1,129 +1,107 @@
-import React from 'react';
-import {
-	Modal, TextInput, Select, NumberInput, SegmentedControl,
-	Button, Stack, Text, Badge, Group, Divider, Paper
-} from '@mantine/core';
-import { useOperation, useOperationActions } from './model/current-operation-store';
+import { Modal, TextInput, NumberInput, SegmentedControl, Button, Group, Box } from '@mantine/core';
+import { useUnit } from 'effector-react';
+import { startTradingFx,stopTradingFx, setParam, $currentTab,$localTabIndex,changeLocalTab } from './model/current-operation-store';
 
-export const OperationModal: React.FC = () => {
-	// Подключаем наш стор и события
-	const op = useOperation();
-	const { setIsModal, updateFields, setIsActive } = useOperationActions();
+export const OperationModal = ({ tabIndex = 1 }: { tabIndex?: number }) => {
+	// Получаем индекс, специфичный для этого окна браузера
+	const activeTabId = useUnit($localTabIndex);
+	const changeTab = useUnit(changeLocalTab);
 
-	const handleStartStop = () => {
-		if (op.isActive) {
-			// Логика ОСТАНОВКИ
-			setIsActive(false);
-			// Тут будет вызов метода "черного ящика" для отмены ордеров
+	// Подтягиваем данные именно для этой вкладки из общего хранилища
+	const params = useUnit($currentTab(activeTabId));
+	const update = useUnit(setParam);
+
+	const handleChange = (key: any, value: any) => {
+		if (key === 'tabIndex') {
+			changeTab(value); // Меняем локальный ID окна
 		} else {
-			// Логика СТАРТА
-			setIsActive(true);
-			// Тут будет вызов метода "черного ящика" для запуска цикла
+			update({ tabIndex: activeTabId, key, value }); // Обновляем настройки в общем сторе
 		}
 	};
 
+	const start = useUnit(startTradingFx);
+	const stop = useUnit(stopTradingFx);
+
 	return (
 		<Modal
-			opened={op.modalOpen}
-			onClose={() => setIsModal(false)}
-			title="Control Panel: Trading Bot"
+			opened={true}
+			onClose={() => {}}
+			withCloseButton={false} // Не закрываемая
+			title={`Гвардеец # ${activeTabId}`}
 			size="sm"
-			centered
 		>
-			<Stack gap="md">
-				{/* Выбор направления */}
+			<Box p="xs">
+				{/* Номер вкладки */}
+				<NumberInput
+					label="Номер вкладки (ID)"
+					value={activeTabId}
+					onChange={(v) => handleChange('tabIndex', v)}
+					mb="sm"
+				/>
+
 				<SegmentedControl
 					fullWidth
-					value={op.side}
-					onChange={(value) => updateFields({ side: value as 'Long' | 'Short' })}
-					data={['Long', 'Short']}
-					color={op.side === 'Long' ? 'green' : 'red'}
-					disabled={op.isActive} // Блокируем смену стороны во время работы
+					value={params.operation}
+					onChange={(v) => handleChange('operation', v)}
+					data={[
+						{ label: 'LONG', value: 'BuyLimit' },
+						{ label: 'SHORT', value: 'SellLimit' },
+					]}
+					mb="sm"
 				/>
 
 				<TextInput
-					label="Ticker"
-					placeholder="MNTUSDT"
-					value={op.ticker}
-					onChange={(e) => updateFields({ ticker: e.currentTarget.value.toUpperCase() })}
-					disabled={op.isActive}
+					label="Тикер"
+					value={params.ticker}
+					onChange={(e) => handleChange('ticker', e.currentTarget.value.toUpperCase())}
+					mb="sm"
 				/>
 
-				<Select
-					label="Operation Type"
-					placeholder="Выберите тип" // Добавим плейсхолдер
-					value={op.operationType} // Убедись, что тут 'limit' или 'limit_pro'
-					onChange={(value) => updateFields({ operationType: value as 'limit' | 'limit_pro' })}
-					data={[
-						{ value: 'limit', label: 'Basic Limit Entry' },
-						{ value: 'limit_pro', label: 'Limit Pro (Chase SL)' },
-					]}
-					disabled={op.isActive}
-					allowDeselect={false} // Чтобы нельзя было сбросить в пустоту
-				/>
-
-				<Group grow>
+				<Group grow mb="sm">
 					<NumberInput
-						label="Qty (Lots)"
-						value={op.qty}
-						onChange={(val) => updateFields({ qty: Number(val) })}
-						min={0}
-						disabled={op.isActive}
+						label="Кол-во (Qty)"
+						value={params.qty}
+						onChange={(v) => handleChange('qty', v)}
+					/>
+					<NumberInput
+						label="Стоп % (SL)"
+						value={params.slPercent}
+						decimalScale={2}       // Замена precision
+						fixedDecimalScale
+						step={0.1}
+						onChange={(v) => handleChange('slPercent', v)}
 					/>
 				</Group>
 
+				<NumberInput
+					label="Зона Суеты (slDistance %)"
+					description="Дистанция активации Гвардейца"
+					value={params.slDistance}
+					decimalScale={2}       // Замена precision
+					fixedDecimalScale
+					step={0.05}
+					onChange={(v) => handleChange('slDistance', v)}
+					mb="xl"
+				/>
+
 				<Group grow>
-					<NumberInput
-						label="SL %"
-						value={op.slPercent}
-						onChange={(val) => updateFields({ slPercent: Number(val) })}
-						decimalScale={2}
-						disabled={op.isActive}
-					/>
-					<NumberInput
-						label="TP %"
-						value={op.tpPercent}
-						onChange={(val) => updateFields({ tpPercent: Number(val) })}
-						decimalScale={2}
-						disabled={op.isActive}
-					/>
+					<Button
+						color="blue"
+						loading={useUnit(startTradingFx.pending)} // Крутилка на кнопке пока идет запуск
+						onClick={() => start(params)}
+					>
+						START
+					</Button>
+
+					<Button
+						color="red"
+						variant="outline"
+						onClick={() => stop(params.tabIndex)}
+					>
+						STOP / CANCEL
+					</Button>
 				</Group>
-
-				{/* Условное поле для режима Limit Pro */}
-				{op.operationType === 'limit_pro' && (
-					<NumberInput
-						label="SL Activation Distance (%)"
-						description="Расстояние до стопа для начала погони"
-						value={op.slDistance}
-						onChange={(val) => updateFields({ slDistance: Number(val) })}
-						decimalScale={2}
-						disabled={op.isActive}
-					/>
-				)}
-
-				<Divider my="xs" label="Execution Status" labelPosition="center" />
-
-				{/* Блок статуса */}
-				<Paper withBorder p="xs" bg="var(--mantine-color-gray-0)">
-					<Group justify="space-between" mb={5}>
-						<Text size="xs" c="dimmed">Status:</Text>
-						{op.isActive && <Badge variant="dot" color="blue">Running</Badge>}
-					</Group>
-					<Text size="sm" fw={500} c={op.isActive ? 'blue' : 'gray'}>
-						{op.status || 'Ready to start...'}
-					</Text>
-				</Paper>
-
-				{/* Кнопка-Трансформер */}
-				<Button
-					fullWidth
-					size="lg"
-					color={op.isActive ? 'red' : 'blue'}
-					onClick={handleStartStop}
-				>
-					{op.isActive ? 'STOP OPERATION' : 'START OPERATION'}
-				</Button>
-			</Stack>
+			</Box>
 		</Modal>
 	);
 };

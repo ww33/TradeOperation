@@ -1,101 +1,103 @@
-import { createStore, createEvent, sample } from 'effector';
-import { useUnit } from 'effector-react';
+import { createStore, createEvent, createEffect } from 'effector';
+import { persist } from 'effector-storage/local';
+import { TradeOperation } from './TradeOperation'; // Путь к твоему классу
 
-// 1. Описываем интерфейс нашей операции
-interface Operation {
+export interface OperationParams {
+	tabIndex: number;
 	ticker: string;
-	operationType: 'limit'| 'limit_pro';
-	side: 'Long' | 'Short';
 	qty: number;
 	slPercent: number;
-	tpPercent: number;
-	modalOpen: boolean;
-	isActive: boolean;
-	status: string;
 	slDistance: number;
+	operation: 'BuyLimit' | 'SellLimit';
 }
 
-// 2. Дефолтные значения (на случай самого первого запуска)
-const DEFAULT_OP: Operation = {
-	ticker: 'MNTUSDT',
-	operationType: 'limit',
-	side: 'Long',
+// Начальные данные для новой вкладки
+const defaultParams: OperationParams = {
+	tabIndex: 1,
+	ticker: 'DOGEUSDT',
 	qty: 1,
-	slPercent: 1.0,
-	tpPercent: 2.0,
-	modalOpen: false,
-	isActive: false,
-	status: '',
+	slPercent: 1,
 	slDistance: 0.2,
+	operation: 'BuyLimit',
 };
 
-// Функция-помощник для загрузки из localStorage
-const loadFromStorage = (): Partial<Operation> => {
-	try {
-		const saved = localStorage.getItem('last_operation_settings');
-		return saved ? JSON.parse(saved) : {};
-	} catch {
-		return {};
+// События
+export const setParam = createEvent<{ tabIndex: number; key: keyof OperationParams; value: any }>();
+export const loadTab = createEvent<number>();
+
+// 1. Создаем локальный стор для текущего окна (БЕЗ persist!)
+// Это заставит каждое окно при открытии иметь свой индекс
+export const $localTabIndex = createStore<number>(1);
+export const changeLocalTab = createEvent<number>();
+$localTabIndex.on(changeLocalTab, (_, next) => next);
+
+// Стор — это объект, где ключи это номера вкладок: { "1": params, "2": params }
+export const $allTabsStore = createStore<Record<number, OperationParams>>({
+	1: { ...defaultParams, tabIndex: 1 }
+})
+	.on(setParam, (state, { tabIndex, key, value }) => {
+		const currentTab = state[tabIndex] || { ...defaultParams, tabIndex };
+		return {
+			...state,
+			[tabIndex]: { ...currentTab, [key]: value }
+		};
+	})
+	.on(loadTab, (state, tabIndex) => {
+		if (!state[tabIndex]) {
+			return { ...state, [tabIndex]: { ...defaultParams, tabIndex } };
+		}
+		return state;
+	});
+
+// Сохраняем в localStorage весь объект вкладок
+persist({ store: $allTabsStore, key: 'trade_tabs_config' });
+
+// Селектор для удобства получения данных конкретной вкладки в React
+export const $currentTab = (tabIndex: number) =>
+	$allTabsStore.map(state => state[tabIndex] || { ...defaultParams, tabIndex });
+
+// Объект для хранения живых инстансов (чтобы потом можно было остановить)
+const activeOperations: Record<number, TradeOperation> = {};
+
+export const startTradingFx = createEffect(async (params: OperationParams) => {
+	console.log(`🚀 ЗАПУСК ГВАРДЕЙЦА #${params.tabIndex} для ${params.ticker}`);
+
+	// 1. ПРОВЕРКА: Если на этой вкладке уже КТО-ТО ЖИВЕТ
+	const existingInstance = activeOperations[params.tabIndex];
+
+	if (existingInstance) {
+		console.warn(`⚠️ Гвардеец #${params.tabIndex} уже запущен. Останавливаем старый...`);
+		// Вызываем наш бронебойный метод остановки
+		await existingInstance.emergencyStop();
+		// Ждем микро-паузу, чтобы сокеты успели закрыться
+		await new Promise(resolve => setTimeout(resolve, 500));
 	}
-};
 
-// --- СОБЫТИЯ ---
+	// Теперь со спокойной душой создаем НОВЫЙ объект
+	const ta = new TradeOperation();//Создаем экземпляр операции
+	activeOperations[params.tabIndex] = ta;// Сохраняем в реестр, чтобы иметь доступ извне (например, для кнопки STOP)
 
-// Для внешнего управления (Черный ящик и Кнопка Старт)
-export const setStatus = createEvent<string>();
-export const setIsActive = createEvent<boolean>();
-
-// Для управления модалкой
-export const setIsModal = createEvent<boolean>();
-export const startNewOperation = createEvent();
-
-// Для обновления полей в самой форме модалки
-export const updateFields = createEvent<Partial<Operation>>();
-
-// --- СТОР ---
-
-export const $operation = createStore<Operation>({ ...DEFAULT_OP, ...loadFromStorage() })
-	// Управление модалкой и сброс статуса
-	.on(startNewOperation, (state) => ({
-		...state,
-		...loadFromStorage(), // Подтягиваем последние настройки
-		modalOpen: true,
-		status: '', // Очищаем старый статус при "New Operation"
-	}))
-	.on(setIsModal, (state, open) => ({ ...state, modalOpen: open }))
-
-	// Управление активностью и статусом (события для Черного ящика)
-	.on(setIsActive, (state, active) => ({ ...state, isActive: active }))
-	.on(setStatus, (state, text) => ({ ...state, status: text }))
-
-	// Обновление полей ввода в модалке
-	.on(updateFields, (state, fields) => ({ ...state, ...fields }));
-
-// --- LOGIC (Middleware) ---
-
-// Сохраняем настройки в localStorage каждый раз, когда меняются поля ввода
-$operation.watch((state) => {
-	const settingsToSave = {
-		ticker: state.ticker,
-		operationType: state.operationType,
-		side: state.side,
-		qty: state.qty,
-		slPercent: state.slPercent,
-		tpPercent: state.tpPercent,
-		slDistance: state.slDistance,
-	};
-	localStorage.setItem('last_operation_settings', JSON.stringify(settingsToSave));
+	try {
+		// 3. ЗАПУСК!
+		const result = await ta.start(params);
+		console.log(`🏁 Операция #${params.tabIndex} завершена: ${result}`);
+		return result;
+	} catch (error) {
+		console.error(`❌ Ошибка в операции #${params.tabIndex}:`, error);
+		throw error;
+	} finally {
+		// Очищаем реестр после завершения
+		delete activeOperations[params.tabIndex];
+	}
 });
 
-// --- ХУКИ ДЛЯ REACT ---
-
-export const useOperation = () => useUnit($operation);
-
-// Удобный хук для событий
-export const useOperationActions = () => useUnit({
-	setStatus,
-	setIsActive,
-	setIsModal,
-	startNewOperation,
-	updateFields
+// Эффект для кнопки CANCEL ALL / STOP
+export const stopTradingFx = createEffect(async (tabIndex: number) => {
+	const instance = activeOperations[tabIndex];
+	if (instance) {
+		await instance.emergencyStop();
+		console.log(`🛑 Гвардеец #${tabIndex} остановлен вручную.`);
+	} else {
+		console.log({instance})
+	}
 });
