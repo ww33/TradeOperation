@@ -123,8 +123,16 @@ export class TradeOperation {
                 } else if (status === 'Filled' && size > 0) {
                     console.warn("❌ ОШИБКА: Ордер якобы Filled, но позиция еще есть! Продолжаем GUARD.");
                     this.orderId = ""; // Сбрасываем ID, чтобы перевыставить лимитку
+                    // ФИКС №1: Обязательно выходим из тика здесь!
+                    // На следующем тике (через 200мс) сработает логика перевыставления (initialExit)
+                    return;
                 }
-
+                // 3. Если мы дошли сюда — значит статус НЕ 'Filled'.
+                // Но на всякий случай проверяем, есть ли вообще что двигать
+                if (!this.orderId) {
+                    console.log("⏸ Ждем появления нового orderId...");
+                    return;
+                }
                 // 3. Если статус 'New' — продолжаем "погоню"
                 await this.handleAmendLogic();
                 return; // <--- ОБЯЗАТЕЛЬНО добавить здесь
@@ -312,7 +320,13 @@ export class TradeOperation {
                     console.error(`Ошибка ${this.mode} Amend:`, res.retMsg);
 
                     // Если ордера нет (уже исполнен или отменен) - сбрасываем ID
-                    if (res.retMsg.includes("not exists") || res.retMsg.includes("too late")) {
+                    // Добавь проверку на "invalid" (это код ошибки 110001 или 20001)
+                    if (
+                        res.retMsg.includes("not exists") ||
+                        res.retMsg.includes("too late") ||
+                        res.retMsg.includes("invalid") // <--- ВОТ ЭТО СПАСЕТ ОТ ПОРТЯНКИ
+                    ) {
+                        console.warn("⚠️ Ордер потерян или исполнен. Сброс ID...");
                         this.orderId = "";
                         return 'ERROR_STUCK';
                     }
