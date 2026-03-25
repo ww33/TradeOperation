@@ -1,8 +1,17 @@
-import { Modal, TextInput, NumberInput, SegmentedControl, Button, Group, Box } from '@mantine/core';
-import { useUnit } from 'effector-react';
-import { startTradingFx,stopTradingFx, setParam, $currentTab,$localTabIndex,changeLocalTab } from './model/current-operation-store';
+import {Modal, TextInput, NumberInput, SegmentedControl, Button, Group, Box, ActionIcon, Tooltip} from '@mantine/core';
+import {useUnit} from 'effector-react';
+import {
+	startTradingFx,
+	stopTradingFx,
+	setParam,
+	$currentTab,
+	$localTabIndex,
+	changeLocalTab,
+	forceExitFx
+} from './model/current-operation-store';
+import {IconRefresh, IconAlertTriangle} from '@tabler/icons-react';
 
-export const OperationModal = ({ tabIndex = 1 }: { tabIndex?: number }) => {
+export const OperationModal = ({tabIndex = 1}: { tabIndex?: number }) => {
 	// Получаем индекс, специфичный для этого окна браузера
 	const activeTabId = useUnit($localTabIndex);
 	const changeTab = useUnit(changeLocalTab);
@@ -15,17 +24,19 @@ export const OperationModal = ({ tabIndex = 1 }: { tabIndex?: number }) => {
 		if (key === 'tabIndex') {
 			changeTab(value); // Меняем локальный ID окна
 		} else {
-			update({ tabIndex: activeTabId, key, value }); // Обновляем настройки в общем сторе
+			update({tabIndex: activeTabId, key, value}); // Обновляем настройки в общем сторе
 		}
 	};
 
 	const start = useUnit(startTradingFx);
 	const stop = useUnit(stopTradingFx);
+	const forceExit = useUnit(forceExitFx);
 
 	return (
 		<Modal
 			opened={true}
-			onClose={() => {}}
+			onClose={() => {
+			}}
 			withCloseButton={false} // Не закрываемая
 			title={`Гвардеец # ${activeTabId}`}
 			size="sm"
@@ -44,8 +55,8 @@ export const OperationModal = ({ tabIndex = 1 }: { tabIndex?: number }) => {
 					value={params.operation}
 					onChange={(v) => handleChange('operation', v)}
 					data={[
-						{ label: 'LONG', value: 'BuyLimit' },
-						{ label: 'SHORT', value: 'SellLimit' },
+						{label: 'LONG', value: 'BuyLimit'},
+						{label: 'SHORT', value: 'SellLimit'},
 					]}
 					mb="sm"
 				/>
@@ -93,13 +104,33 @@ export const OperationModal = ({ tabIndex = 1 }: { tabIndex?: number }) => {
 						START
 					</Button>
 
+					{/*<Button*/}
+					{/*	color="red"*/}
+					{/*	variant="outline"*/}
+					{/*	onClick={() => stop(params.tabIndex)}*/}
+					{/*>*/}
+					{/*	STOP / CANCEL*/}
+					{/*</Button>*/}
 					<Button
-						color="red"
+						fullWidth
+						color="orange"
 						variant="outline"
-						onClick={() => stop(params.tabIndex)}
+						// leftSection={<IconAlertTriangle size={18} />} // Если есть иконки
+						onClick={() => forceExit(params.tabIndex)}
 					>
-						STOP / CANCEL
+						CLOSE
 					</Button>
+
+					<ActionIcon
+						variant="subtle"
+						color="gray"
+						size="lg"
+						onClick={() => window.location.reload()}
+
+					>
+						<IconRefresh size={20} stroke={1.5}/>
+					</ActionIcon>
+
 				</Group>
 			</Box>
 		</Modal>

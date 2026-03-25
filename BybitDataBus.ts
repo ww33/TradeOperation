@@ -1,5 +1,5 @@
 import {WebsocketClient} from 'bybit-api'
-import {getBybitKey} from './settings.ts'
+import {getBybitKey} from './settings'
 
 const {key, secret} = getBybitKey()
 
@@ -24,10 +24,33 @@ export class BybitDataBus {
         this.setupListeners();
     }
 
+    public async waitForData(timeoutMs: number = 10000): Promise<boolean> {
+        console.log(`[DataBus] Начинаю ожидание котировок для ${this.currentSymbol}...`);
+        const start = Date.now();
+
+        while (Date.now() - start < timeoutMs) {
+            // Проверяем флаг готовности
+            if (this.isDataReady) {
+                console.log(`[DataBus] ✅ Данные получены через ${Date.now() - start}мс`);
+                return true;
+            }
+
+            // Каждую секунду пишем в консоль, что мы еще живы
+            if ((Date.now() - start) % 1000 < 100) {
+                console.log(`[DataBus] Все еще жду... (${Math.round((Date.now() - start)/1000)}с)`);
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+
+        console.error(`[DataBus] ❌ Таймаут! Данные для ${this.currentSymbol} не пришли за ${timeoutMs}мс`);
+        return false;
+    }
+
     private setupListeners() {
         // 1. Обработка данных
         this.ws.on('update', (response) => {
-            const { topic, data } = response;
+            const {topic, data} = response;
             if (topic.startsWith('orderbook')) {
                 const b = data.b && data.b.length > 0 ? data.b[0][0] : null;
                 const a = data.a && data.a.length > 0 ? data.a[0][0] : null;
@@ -69,6 +92,7 @@ export class BybitDataBus {
             }, 100);
         });
     }
+
     public stop() {
         this.isDataReady = false; // Сбрасываем флаг готовности
 
@@ -76,7 +100,7 @@ export class BybitDataBus {
             // closeAll() — это встроенный метод библиотеки bybit-api,
             // который рубит все активные соединения и подписки
             this.ws.closeAll();
-            console.log("[DataBus] Соединение с сокетом закрыто, подписки отменены.");
+            console.log("[DataBus] Соединение с сокетом закрыто");
         }
     }
 }

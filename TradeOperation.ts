@@ -31,6 +31,7 @@ export class TradeOperation {
     constructor() {
         this.bus = new BybitDataBus();
     }
+    private resolve_my: ((value: any) => void) | null = null;
 
     public async start(params: any) {
         this.params = params;
@@ -39,17 +40,34 @@ export class TradeOperation {
         // 1. Подписываемся и ждем первых цен
         await this.bus.subscribe(params.ticker);
 
-        // 2. Создаем первый ордер (Limit Entry)
+        // В методе start() перед вызовом initialEntry
+        console.log("⏳ Ожидание готовности данных DataBus...");
+
+        // Ждем до 5 секунд, пока шина не скажет, что данные по тикеру пришли
+        const isReady = await this.bus.waitForData(5000);
+
+        if (!isReady) {
+            throw new Error("DataBus Timeout: Данные по тикеру не получены");
+        }
         await this.initialEntry(params);
 
         // 3. Запускаем "Петлю управления"
         this.timer = setInterval(() => this.tick(), 200);
+
+        // Возвращаем промис, который "держит" эффект в сторе активным
+        return new Promise((res) => {
+            this.resolve = res; // Сохраняем рычаг для завершения
+        });
     }
 
     private async tick() {
         // 1. ПРЕДОХРАНИТЕЛИ: проверка связи и занятости API
-        if (this.isStopping || !this.bus.isDataReady || this.isApiBusy) return;
-
+        if (this.isStopping || this.isApiBusy || !this.bus.isDataReady) {
+            //console.log(`[TICK] Busy: ${this.isApiBusy}, Ready: ${this.bus.isDataReady}, Mode: ${this.mode}`);
+            return;
+        }
+        // Гарантируем паузу 200мс между запросами (наш "бронежилет")
+        if (Date.now() - this.lastRequestTime < 200) return;
         // ПРОВЕРКА: А есть ли вообще позиция?
         // Если мы в режиме WATCH или GUARD, но позиция на бирже уже 0
         if (this.mode === 'WATCH' || this.mode === 'GUARD') {
@@ -57,18 +75,26 @@ export class TradeOperation {
                 category: 'linear',
                 symbol: this.params.ticker
             });
-
-            const size = parseFloat(pos.result.list[0]?.size || "0");
+            const list = pos.result.list[0];
+            const size = parseFloat(list?.size || "0");
 
             if (size === 0) {
                 console.log("🏁 Позиция закрыта извне (стоп или TP). Завершаем работу.");
                 this.stop("Done (External)");
                 return;
             }
-        }
 
-        // Гарантируем паузу 200мс между запросами (наш "бронежилет")
-        if (Date.now() - this.lastRequestTime < 200) return;
+            // // 2. МОЯ добавка: Скрещиваем "Авто-трекинг стопа"
+            const remoteSL = list?.stopLoss || "0";
+            //console.log('list',list)
+            //console.log('stopLoss',list?.stopLoss)
+            //
+            // Если на бирже есть стоп и он не совпадает с тем, что в памяти Гвардейца
+            if (parseFloat(remoteSL) > 0 && remoteSL !== this.orderStopLoss) {
+                console.log(`🔄 [${this.params.ticker}] Стоп изменен вручную: ${this.orderStopLoss} -> ${remoteSL}`);
+                this.orderStopLoss = remoteSL; // Гвардеец пересчитывает Зону Суеты на лету
+            }
+        }
 
         try {
             this.isApiBusy = true;
@@ -82,6 +108,13 @@ export class TradeOperation {
                     this.mode = 'WATCH';
                     return;
                 }
+
+                // 2. ФИКС: Если ордер ОТМЕНЕН (например, Post-Only) — ПЕРЕВЫСТАВЛЯЕМ
+                if (status === 'Cancelled' || this.orderId === "") {
+                    console.warn("⚠️ Входной ордер отменен биржей. Повторная попытка входа...");
+                    await this.initialEntry(this.params); // Пробуем зайти снова по новой цене
+                    return;
+                }
                 // ВАЖНО: Если amendOrder вернул ошибку "order not exists"
                 // Мы должны СРАЗУ сбросить флаг или вызвать проверку статуса
                 const amendResult = await this.handleAmendLogic();
@@ -89,6 +122,7 @@ export class TradeOperation {
                 if (amendResult === 'ERROR_STUCK') {
                     console.warn("Похоже, ордер потерян. Проверяем историю...");
                     // На следующем тике checkOrderStatus всё разрулит
+                    return;
                 }
                 return; // <--- ОБЯЗАТЕЛЬНО добавить здесь
             }
@@ -104,14 +138,9 @@ export class TradeOperation {
                 // 1. Проверяем статус (если ID стерт, checkOrderStatus полезет в историю)
                 const status = await this.checkOrderStatus();
 
-                // 2. Если ордер в истории 'Cancelled' или 'Rejected' (Post-Only выбил)
-                if (status === 'Cancelled' || status === 'Rejected' || this.orderId === "") {
-                    console.log("⚠️ Ордера на выход нет. Перевыставляю (initialExit)...");
-                    await this.initialExit(); // СОЗДАЕМ НОВУЮ ЛИМИТКУ
-                    return;
-                }
+
                 // В tick() перед тем как написать "Позиция закрыта"
-                const pos = await client.getPositionInfo({ category: 'linear', symbol: this.params.ticker });
+                const pos = await client.getPositionInfo({category: 'linear', symbol: this.params.ticker});
                 const size = Math.abs(parseFloat(pos.result.list[0]?.size || "0"));
 
                 if (status === 'Filled' && size === 0) {
@@ -119,7 +148,7 @@ export class TradeOperation {
                     this.orderId = ""; // Сбрасываем ID
                     this.orderPrice = "0";
                     this.stop("Done");
-
+                    return
                 } else if (status === 'Filled' && size > 0) {
                     console.warn("❌ ОШИБКА: Ордер якобы Filled, но позиция еще есть! Продолжаем GUARD.");
                     this.orderId = ""; // Сбрасываем ID, чтобы перевыставить лимитку
@@ -127,6 +156,14 @@ export class TradeOperation {
                     // На следующем тике (через 200мс) сработает логика перевыставления (initialExit)
                     return;
                 }
+
+                //Если ордер в истории 'Cancelled' или 'Rejected' (Post-Only выбил)
+                if ((status === 'Cancelled' || status === 'Rejected' || this.orderId === "") && size > 0) {
+                    console.log("⚠️ Ордера на выход нет. Перевыставляю (initialExit)...");
+                    await this.initialExit(); // СОЗДАЕМ НОВУЮ ЛИМИТКУ
+                    return;
+                }
+
                 // 3. Если мы дошли сюда — значит статус НЕ 'Filled'.
                 // Но на всякий случай проверяем, есть ли вообще что двигать
                 if (!this.orderId) {
@@ -154,6 +191,18 @@ export class TradeOperation {
                 orderId: this.orderId,
                 limit: 1
             });
+            // Ищем наш ордер на выход (по ID или по стороне/типу)
+            const myExitOrder = res.result.list.find(o => o.orderId === this.orderId);
+            //console.log({myExitOrder})
+            if (myExitOrder) {
+                const remotePrice = myExitOrder.stopLoss;
+
+                // Если цена ордера на бирже изменилась (ты потянул его мышкой)
+                if (parseFloat(remotePrice) > 0 && remotePrice !== this.orderStopLoss) {
+                    console.log(`🎯 Гвардеец подхватил движение ордера: ${this.orderStopLoss} -> ${remotePrice}`);
+                    //this.orderStopLoss = remotePrice; // Синхронизируем цель охраны
+                }
+            }
 
             // 2. Если ордер найден в активных — берем его статус (New или PartiallyFilled)
             if (res.retCode === 0 && res.result.list.length > 0) {
@@ -202,7 +251,7 @@ export class TradeOperation {
             await client.setTPSLMode({
                 category: 'linear',
                 symbol: params.ticker,
-                tpSlMode: 'Partial'
+                tpSlMode: 'Full'//'Partial'
             }).catch(() => {
             }); // Игнорируем, если уже включен
 
@@ -271,6 +320,16 @@ export class TradeOperation {
     }
 
     private async handleAmendLogic(): Promise<string | void> {
+
+        // ПРЕДОХРАНИТЕЛЬ: Если ID пуст - делать тут нечего
+        if (!this.orderId || this.orderId === "") {
+            return;
+        }
+
+        if (this.isApiBusy) {
+            return;
+        }
+
         const isLong = this.params.operation === 'BuyLimit';
         const targetPrice = isLong ? this.bus.bid : this.bus.ask;
 
@@ -283,7 +342,8 @@ export class TradeOperation {
 
         const p1 = parseFloat(formattedTarget);
         const p2 = parseFloat(this.orderPrice);
-
+        // @ts-ignore
+        console.log(`[DEBUG] Order: ${this.orderPrice}, Market: ${targetPrice}, Diff: ${Math.abs(parseFloat(this.orderPrice) - targetPrice)}`);
         // ЗАЩИТА: Если цена ордера еще не инициализирована (0 или NaN)
         if (!p2 || isNaN(p1) || isNaN(p2)) {
             // console.log("Ожидание инициализации цен...");
@@ -321,18 +381,18 @@ export class TradeOperation {
 
                     // Если ордера нет (уже исполнен или отменен) - сбрасываем ID
                     // Добавь проверку на "invalid" (это код ошибки 110001 или 20001)
-                    if (
+                    // Список "фатальных" ошибок, после которых ордера точно нет
+                    const isFatal =
                         res.retMsg.includes("not exists") ||
                         res.retMsg.includes("too late") ||
-                        res.retMsg.includes("invalid") // <--- ВОТ ЭТО СПАСЕТ ОТ ПОРТЯНКИ
-                    ) {
-                        console.warn("⚠️ Ордер потерян или исполнен. Сброс ID...");
-                        this.orderId = "";
-                        return 'ERROR_STUCK';
-                    }
-                    // 2. ФИКС ДЛЯ СКРИНШОТА: Частичное исполнение
-                    // "you cannot modify... in PartiallyFilled status"
-                    if (res.retMsg.includes("PartiallyFilled")) {
+                        res.retMsg.includes("invalid") ||
+                        res.retMsg.includes("not found");
+                    if (isFatal) {
+                        console.warn("🛑 КРИТИЧЕСКИЙ СБРОС ID: Ордер потерян. Очистка...");
+                        this.orderId = "";      // Стираем ID
+                        this.orderPrice = "0";  // Сбрасываем цену для чистоты
+                        return 'ERROR_STUCK';   // Сигнал для выхода из тика
+                    } else if (res.retMsg.includes("PartiallyFilled")) {
                         console.log("🧩 Ордер частично исполнен. Замираем и ждем наполнения...");
 
                         // Обновляем orderPrice текущей ценой, чтобы percentDiff стал 0
@@ -387,7 +447,9 @@ export class TradeOperation {
     private async initialExit() {
         const isLong = this.params.operation === 'BuyLimit';
         const side = isLong ? 'Sell' : 'Buy'; // Реверс стороны
-        const exitPriceStr = isLong ? this.bus.ask : this.bus.bid;
+        const tick = this.tickSize;
+        // @ts-ignore
+        const exitPriceStr = isLong ? (this.bus.ask + tick) : (this.bus.bid - tick)
         const formattedPrice = roundStep(exitPriceStr, this.tickSize);
 
         const res = await client.submitOrder({
@@ -421,8 +483,60 @@ export class TradeOperation {
 
         this.orderId = ""; // Стираем ID сразу, чтобы Amend не прошел
         this.bus.stop();
-        this.resolve(reason);
+
+        if (this.resolve) {
+            this.resolve(reason);
+            // @ts-ignore
+            this.resolve = null;
+        }
     }
+    public async forceExit() {
+        console.log(`🚨 [${this.params.ticker}] ЭКСТРЕННЫЙ ВЫХОД (БЕЗОПАСНЫЙ РЕЖИМ)`);
+
+        this.mode = 'GUARD';
+
+        // 1. Сначала вызываем initialExit.
+        // Он выставит лимитку со сдвигом в 1 тик (наш "мягкий" выход).
+        try {
+            await this.initialExit();
+
+            // 2. Только если лимитка ВСТАЛА (this.orderId теперь не пустой)
+            if (this.orderId) {
+                console.log("✅ Лимитка выхода в стакане. Снимаю старый системный стоп...");
+                // Теперь можно безопасно убрать старые стопы, чтобы они не мешались
+                await client.cancelAllOrders({
+                    category: 'linear',
+                    symbol: this.params.ticker
+                });
+            }
+        } catch (e: any) {
+            console.error("❌ Ошибка при forceExit:", e.message);
+            // Если лимитка не встала - СТОП ОСТАЕТСЯ НА МЕСТЕ. Ты защищен.
+        }
+    }
+    // public async forceExit() {
+    // 	console.log(`🚨 [${this.params.ticker}] ЭКСТРЕННОЕ ЗАКРЫТИЕ ВЫЗВАНО РУКАМИ!`);
+    //
+    // 	// 1. Блокируем новые тики и останавливаем текущий режим
+    // 	this.isStopping = false; // Убедимся, что мы еще работаем
+    // 	this.mode = 'GUARD';     // Мгновенно переключаем в режим защиты
+    //
+    // 	// 2. Стираем старый ID, чтобы tick() на следующем цикле перевыставил ордер
+    // 	if (this.orderId) {
+    // 		try {
+    // 			await client.cancelAllOrders({
+    // 				category: 'linear',
+    // 				symbol: this.params.ticker
+    // 			});
+    // 			console.log("Старые ордера отменены.");
+    // 		} catch (e) {
+    // 			console.warn("Не удалось отменить (возможно, их нет)");
+    // 		}
+    // 	}
+    //
+    // 	this.orderId = ""; // Сбрасываем ID, чтобы сработал блок initialExit в tick()
+    // 	console.log("Режим переключен в GUARD. Начинаю выход лимитками...");
+    // }
     public async emergencyStop() {
         console.log(`🛑 [${this.params?.ticker || '---'}] ВЫЗВАН EMERGENCY STOP`);
 

@@ -79,6 +79,7 @@ export const startTradingFx = createEffect(async (params: OperationParams) => {
 
 	try {
 		// 3. ЗАПУСК!
+		console.log('запуск')
 		const result = await ta.start(params);
 		console.log(`🏁 Операция #${params.tabIndex} завершена: ${result}`);
 		return result;
@@ -99,5 +100,15 @@ export const stopTradingFx = createEffect(async (tabIndex: number) => {
 		console.log(`🛑 Гвардеец #${tabIndex} остановлен вручную.`);
 	} else {
 		console.log({instance})
+	}
+});
+
+export const forceExitFx = createEffect(async (tabIndex: number) => {
+	//console.log('этот код выводится')
+	const instance = activeOperations[tabIndex];
+	if (instance) {
+		await instance.forceExit();
+	} else {
+		console.warn(`Инстанс для вкладки ${tabIndex} не найден`);
 	}
 });
