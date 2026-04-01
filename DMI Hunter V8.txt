@@ -1,0 +1,69 @@
+// @version=5
+indicator("DMI Hunter V8", overlay=false, max_labels_count=500)
+dmiLength     = input.int(14, "Период DMI")
+overheatLimit = input.float(30.0, "Порог активации (DMI)")
+resetBars     = input.int(40, "Сброс цели через (баров)")
+
+// --- 2. РАСЧЕТ DMI MODIFIED (DI+ - DI-) ---
+[diPlus, diMinus, adx] = ta.dmi(dmiLength, dmiLength)
+dmiMod = diPlus - diMinus
+
+// --- 3. ЛОГИКА ЗАХВАТА ПИКА (peakDMI) ---
+var float peakDMI = 0.0
+var float priceAtPeak = 0.0
+var int barsSincePeak = 0
+// --- Добавь в начало блока переменных ---
+var bool hasFired = false
+
+// Если DMI выше порога и растет — обновляем пик
+if dmiMod > overheatLimit
+    if dmiMod > peakDMI
+        peakDMI := dmiMod
+        priceAtPeak := high
+        barsSincePeak := 0
+    else
+        barsSincePeak += 1
+else
+    barsSincePeak += 1
+
+// Сброс цели, если импульс затух или прошло много времени
+if barsSincePeak > resetBars or dmiMod < 5
+    peakDMI := 0.0
+    priceAtPeak := 0.0
+
+// --- 4. ПОИСК СИГНАЛОВ ---
+isHunting = peakDMI > 0
+// Сбрасываем флаг выстрела, когда цель обнуляется
+if not isHunting
+    hasFired := false
+// Безопасный: LH (Lower High)
+// 1. Мы в охоте (isHunting)
+// 2. Текущий хай ниже пикового (high < priceAtPeak)
+// 3. DMI в целом ниже пикового (dmiMod < peakDMI)
+// 4. ТРИГГЕР: Свеча закрылась ниже своего открытия (красная)
+//    И ниже минимума ПРЕДЫДУЩЕЙ свечи (подтверждение слома)
+isSafeShort = isHunting and not hasFired and
+         high < priceAtPeak and
+         dmiMod < peakDMI and
+         close < open and
+         close < low[1]
+if isSafeShort
+    hasFired := true
+// --- 5. ВИЗУАЛИЗАЦИЯ В ПОДВАЛЕ (Осциллятор) ---
+plot(dmiMod, "DMI Modified", color=dmiMod > 0 ? color.teal : color.maroon, linewidth=2)
+hline(overheatLimit, "Overheat Level", color=color.gray, linestyle=hline.style_dashed)
+hline(0, "Zero Line", color=color.white)
+
+// Визуальный уровень захваченного пика DMI (в подвале)
+plot(isHunting ? peakDMI : na, "Peak DMI Level", color=color.red, style=plot.style_linebr)
+
+// --- 6. ВИЗУАЛИЗАЦИЯ НА ГРАФИКЕ (Force Overlay) ---
+// Линия цели на графике цены
+plot(isHunting ? priceAtPeak : na, "Target Price", color=color.new(color.red, 50),
+     style=plot.style_linebr, linewidth=2, force_overlay=true)
+
+plotshape(isSafeShort, "LH Safe", shape.labeldown, location.abovebar,
+     color.orange, text="LH", textcolor=color.white, force_overlay=true)
+
+signal = isSafeShort ? -1 : 0
+plot(signal,'signal', display = display.none)
